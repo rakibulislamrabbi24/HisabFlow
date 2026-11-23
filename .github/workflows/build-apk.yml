@@ -3,7 +3,8 @@ name: Build HisabFlow APK
 on:
   push:
     paths:
-      - 'uploads/*.zip'
+      - '**.zip'
+      - '**.ZIP'
   workflow_dispatch:
 
 permissions:
@@ -18,9 +19,19 @@ jobs:
       - name: Find latest ZIP
         id: zip
         run: |
-          ZIP=$(ls -t uploads/*.zip | head -n1)
-          echo "ZIP=$ZIP"
-          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+          BEST=""
+          BEST_TIME=0
+          while IFS= read -r f; do
+            T=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            T=${T:-0}
+            if [ "$T" -ge "$BEST_TIME" ]; then BEST="$f"; BEST_TIME="$T"; fi
+          done < <(find . -type f -iname "*.zip" -not -path "./.git/*" -not -path "./project/*")
+          if [ -z "$BEST" ]; then
+            echo "::error::রিপোতে কোনো ZIP ফাইল পাওয়া যায়নি। HisabFlow.zip আপলোড করুন।"
+            exit 1
+          fi
+          echo "ZIP=$BEST"
+          echo "path=$BEST" >> "$GITHUB_OUTPUT"
 
       - name: Extract ZIP
         id: root
