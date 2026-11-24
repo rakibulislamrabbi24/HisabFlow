@@ -59,7 +59,7 @@ jobs:
         working-directory: ${{ steps.root.outputs.dir }}
         run: npm run build
 
-      - name: Add Android platform (if missing), apply icons and sync
+      - name: Add Android platform (if missing), apply icons, permissions and sync
         working-directory: ${{ steps.root.outputs.dir }}
         run: |
           if [ ! -d android ]; then npx cap add android; fi
@@ -67,6 +67,8 @@ jobs:
             rm -f android/app/src/main/res/mipmap-*/ic_launcher*.png
             cp -r android-res/. android/app/src/main/res/
           fi
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q "USE_BIOMETRIC" "$MANIFEST" || sed -i 's#</manifest>#    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n</manifest>#' "$MANIFEST"
           npx cap sync android
 
       - name: Build debug APK
