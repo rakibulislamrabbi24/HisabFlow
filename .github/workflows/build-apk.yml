@@ -39,6 +39,14 @@ jobs:
             echo "::error::সাইনিং সিক্রেট সেট করা নেই:$missing — Settings → Secrets and variables → Actions থেকে যোগ করুন (গাইড দেখুন)।"
             exit 1
           fi
+          # মান না দেখিয়ে শুধু দৈর্ঘ্য ও অদৃশ্য/বিদেশি অক্ষরের সংখ্যা (কপি-পেস্টের ভুল ধরার জন্য)
+          diag() {
+            bad=$(printf '%s' "$2" | LC_ALL=C tr -d '\040-\176' | wc -c | tr -d ' ')
+            echo "$1: দৈর্ঘ্য=${#2}, ASCII-বহির্ভূত/অদৃশ্য বাইট=$bad"
+          }
+          diag KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
+          diag KEY_PASSWORD "$KEY_PASSWORD"
+          diag KEY_ALIAS "$KEY_ALIAS"
           echo "সাইনিং সিক্রেট আছে ✓"
 
       # ---------- ২) সবচেয়ে নতুন ZIP খোঁজা ও খোলা ----------
@@ -142,7 +150,21 @@ jobs:
           if [ -z "$IN" ]; then echo "::error::APK ফাইল পাওয়া যায়নি ($APKDIR)"; exit 1; fi
           echo "input APK: $IN"
 
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # কপি-পেস্টে ঢুকে যাওয়া অদৃশ্য অক্ষর, নতুন লাইন বা ফাঁকা বাদ দেওয়া
+          KEYSTORE_PASSWORD=$(printf '%s' "$KEYSTORE_PASSWORD" | LC_ALL=C tr -cd '\041-\176')
+          KEY_PASSWORD=$(printf '%s' "$KEY_PASSWORD" | LC_ALL=C tr -cd '\041-\176')
+          KEY_ALIAS=$(printf '%s' "$KEY_ALIAS" | LC_ALL=C tr -cd '\041-\176')
+          export KEYSTORE_PASSWORD KEY_PASSWORD KEY_ALIAS
+          printf '%s' "$KEYSTORE_BASE64" | LC_ALL=C tr -cd 'A-Za-z0-9+/=' | base64 -d > "$RUNNER_TEMP/release.jks"
+
+          # সাইন করার আগেই কী-স্টোর খুলে দেখা, যাতে ভুল হলে পরিষ্কার বার্তা আসে
+          if ! keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS" > "$RUNNER_TEMP/kt.log" 2>&1; then
+            echo "::error::কী-স্টোর খোলা যায়নি। KEYSTORE_PASSWORD, KEY_ALIAS বা KEYSTORE_BASE64 ভুল। সিক্রেটগুলো মুছে secrets.txt থেকে আবার কপি করে বসান।"
+            head -n 3 "$RUNNER_TEMP/kt.log" | sed 's/^/keytool: /'
+            exit 1
+          fi
+          echo "কী-স্টোর খোলা গেছে ✓"
+
           OUT="HisabFlow-${VERSION}.apk"
           "$BT/zipalign" -p -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" sign \
