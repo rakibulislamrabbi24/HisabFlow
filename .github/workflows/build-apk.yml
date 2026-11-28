@@ -10,12 +10,38 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # ---------- ১) সাইনিং সিক্রেট আছে কিনা আগেই দেখা ----------
+      - name: Check signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          missing=""
+          [ -z "$KEYSTORE_BASE64" ] && missing="$missing KEYSTORE_BASE64"
+          [ -z "$KEYSTORE_PASSWORD" ] && missing="$missing KEYSTORE_PASSWORD"
+          [ -z "$KEY_ALIAS" ] && missing="$missing KEY_ALIAS"
+          [ -z "$KEY_PASSWORD" ] && missing="$missing KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::সাইনিং সিক্রেট সেট করা নেই:$missing — Settings → Secrets and variables → Actions থেকে যোগ করুন (গাইড দেখুন)।"
+            exit 1
+          fi
+          echo "সাইনিং সিক্রেট আছে ✓"
+
+      # ---------- ২) সবচেয়ে নতুন ZIP খোঁজা ও খোলা ----------
       - name: Find latest ZIP
         id: zip
         run: |
@@ -39,7 +65,7 @@ jobs:
           rm -rf project && mkdir project
           unzip -q "${{ steps.zip.outputs.path }}" -d project
           PKG=$(find project -maxdepth 3 -name package.json -not -path "*/node_modules/*" | head -n1)
-          if [ -z "$PKG" ]; then echo "package.json পাওয়া যায়নি"; exit 1; fi
+          if [ -z "$PKG" ]; then echo "::error::package.json পাওয়া যায়নি"; exit 1; fi
           echo "dir=$(dirname "$PKG")" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
@@ -51,6 +77,7 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # ---------- ৩) ওয়েব বিল্ড ----------
       - name: Install dependencies
         working-directory: ${{ steps.root.outputs.dir }}
         run: npm install
@@ -59,7 +86,9 @@ jobs:
         working-directory: ${{ steps.root.outputs.dir }}
         run: npm run build
 
-      - name: Add Android platform (if missing), apply icons, permissions and sync
+      # ---------- ৪) Android প্রজেক্ট, আইকন, ভার্সন ----------
+      - name: Add Android platform, apply icons, set version, sync
+        id: android
         working-directory: ${{ steps.root.outputs.dir }}
         run: |
           if [ ! -d android ]; then npx cap add android; fi
@@ -67,30 +96,97 @@ jobs:
             rm -f android/app/src/main/res/mipmap-*/ic_launcher*.png
             cp -r android-res/. android/app/src/main/res/
           fi
-          MANIFEST=android/app/src/main/AndroidManifest.xml
-          grep -q "USE_BIOMETRIC" "$MANIFEST" || sed -i 's#</manifest>#    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n</manifest>#' "$MANIFEST"
+          VERSION=$(node -p "require('./package.json').version")
+          VERSION_CODE=$(date -u +%y%j%H%M)
+          GRADLE=android/app/build.gradle
+          sed -i -E "s/versionCode [0-9]+/versionCode ${VERSION_CODE}/; s/versionName \"[^\"]*\"/versionName \"${VERSION}\"/" "$GRADLE"
+          grep -nE "versionCode|versionName" "$GRADLE"
+          if ! grep -q "versionCode ${VERSION_CODE}" "$GRADLE"; then
+            echo "::error::versionCode বসানো যায়নি — android/app/build.gradle দেখুন"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
           npx cap sync android
 
-      - name: Build debug APK
+      # ---------- ৫) APK বিল্ড (আগে release, না হলে debug) ----------
+      - name: Build APK
+        id: gradle
         working-directory: ${{ steps.root.outputs.dir }}/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          if ./gradlew assembleRelease --no-daemon; then
+            echo "variant=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::release বিল্ড ব্যর্থ হয়েছে, debug বিল্ড দিয়ে চেষ্টা করা হচ্ছে"
+            ./gradlew assembleDebug --no-daemon
+            echo "variant=debug" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Rename APK
+      # ---------- ৬) স্থায়ী কী দিয়ে সাইন ----------
+      - name: Sign APK with the permanent key
+        id: sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          APK=$(find "${{ steps.root.outputs.dir }}/android" -name "app-debug.apk" | head -n1)
-          cp "$APK" HisabFlow.apk
+          set -eu
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -n1)
+          echo "build-tools: $BT"
 
+          APKDIR="${{ steps.root.outputs.dir }}/android/app/build/outputs/apk/${{ steps.gradle.outputs.variant }}"
+          IN=$(find "$APKDIR" -name "*.apk" | head -n1)
+          if [ -z "$IN" ]; then echo "::error::APK ফাইল পাওয়া যায়নি ($APKDIR)"; exit 1; fi
+          echo "input APK: $IN"
+
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          OUT="HisabFlow-${VERSION}.apk"
+          "$BT/zipalign" -p -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          rm -f "$RUNNER_TEMP/release.jks"
+
+          "$BT/apksigner" verify --verbose --print-certs "$OUT" | tee cert.txt
+          SHA=$(grep -m1 "certificate SHA-256 digest" cert.txt | sed 's/.*: //')
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### HisabFlow ${VERSION} (build ${VERSION_CODE})"
+            echo ""
+            echo "- ধরন: ${{ steps.gradle.outputs.variant }}"
+            echo "- সাইনিং সার্টিফিকেট SHA-256: \`${SHA}\`"
+            echo ""
+            echo "প্রতিটি বিল্ডে এই SHA-256 একই থাকলে আপডেট ডেটা না মুছে ইনস্টল হবে।"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "HisabFlow ${VERSION} — build ${VERSION_CODE}"
+            echo ""
+            echo "সাইনিং সার্টিফিকেট SHA-256:"
+            echo "${SHA}"
+            echo ""
+            echo "আপডেট ইনস্টলের আগে সেটিংস থেকে ব্যাকআপ নিয়ে রাখুন।"
+          } > release-notes.md
+
+      # ---------- ৭) আর্টিফ্যাক্ট ও রিলিজ ----------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: HisabFlow-APK
-          path: HisabFlow.apk
+          path: ${{ steps.sign.outputs.apk }}
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: HisabFlow build ${{ github.run_number }}
-          files: HisabFlow.apk
+          tag_name: v${{ env.VERSION }}-build${{ github.run_number }}
+          name: HisabFlow ${{ env.VERSION }} (build ${{ github.run_number }})
+          body_path: release-notes.md
+          files: ${{ steps.sign.outputs.apk }}
