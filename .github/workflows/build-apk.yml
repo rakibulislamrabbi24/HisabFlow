@@ -27,14 +27,10 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           missing=""
           [ -z "$KEYSTORE_BASE64" ] && missing="$missing KEYSTORE_BASE64"
           [ -z "$KEYSTORE_PASSWORD" ] && missing="$missing KEYSTORE_PASSWORD"
-          [ -z "$KEY_ALIAS" ] && missing="$missing KEY_ALIAS"
-          [ -z "$KEY_PASSWORD" ] && missing="$missing KEY_PASSWORD"
           if [ -n "$missing" ]; then
             echo "::error::সাইনিং সিক্রেট সেট করা নেই:$missing — Settings → Secrets and variables → Actions থেকে যোগ করুন (গাইড দেখুন)।"
             exit 1
@@ -45,9 +41,8 @@ jobs:
             echo "$1: দৈর্ঘ্য=${#2}, ASCII-বহির্ভূত/অদৃশ্য বাইট=$bad"
           }
           diag KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
-          diag KEY_PASSWORD "$KEY_PASSWORD"
-          diag KEY_ALIAS "$KEY_ALIAS"
-          echo "সাইনিং সিক্রেট আছে ✓"
+          diag KEYSTORE_BASE64 "$KEYSTORE_BASE64"
+          echo "সাইনিং সিক্রেট আছে ✓ (KEY_ALIAS ও KEY_PASSWORD সিক্রেট আর লাগে না, থাকলে উপেক্ষা করা হয়)"
 
       # ---------- ২) সবচেয়ে নতুন ZIP খোঁজা ও খোলা ----------
       - name: Find latest ZIP
@@ -137,8 +132,6 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -eu
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
@@ -152,18 +145,24 @@ jobs:
 
           # কপি-পেস্টে ঢুকে যাওয়া অদৃশ্য অক্ষর, নতুন লাইন বা ফাঁকা বাদ দেওয়া
           KEYSTORE_PASSWORD=$(printf '%s' "$KEYSTORE_PASSWORD" | LC_ALL=C tr -cd '\041-\176')
-          KEY_PASSWORD=$(printf '%s' "$KEY_PASSWORD" | LC_ALL=C tr -cd '\041-\176')
-          KEY_ALIAS=$(printf '%s' "$KEY_ALIAS" | LC_ALL=C tr -cd '\041-\176')
-          export KEYSTORE_PASSWORD KEY_PASSWORD KEY_ALIAS
+          export KEYSTORE_PASSWORD
           printf '%s' "$KEYSTORE_BASE64" | LC_ALL=C tr -cd 'A-Za-z0-9+/=' | base64 -d > "$RUNNER_TEMP/release.jks"
 
           # সাইন করার আগেই কী-স্টোর খুলে দেখা, যাতে ভুল হলে পরিষ্কার বার্তা আসে
-          if ! keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS" > "$RUNNER_TEMP/kt.log" 2>&1; then
-            echo "::error::কী-স্টোর খোলা যায়নি। KEYSTORE_PASSWORD, KEY_ALIAS বা KEYSTORE_BASE64 ভুল। সিক্রেটগুলো মুছে secrets.txt থেকে আবার কপি করে বসান।"
+          if ! keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass:env KEYSTORE_PASSWORD > "$RUNNER_TEMP/kt.log" 2>&1; then
+            echo "::error::কী-স্টোর খোলা যায়নি। KEYSTORE_PASSWORD বা KEYSTORE_BASE64 ভুল। দুটি সিক্রেট মুছে নতুন করে বসান (পাসওয়ার্ড হবে secrets.txt-এর '=' এর পরের ৩২ অক্ষর, KEYSTORE_BASE64 হবে KEYSTORE_BASE64.txt-এর পুরো লেখা)।"
             head -n 3 "$RUNNER_TEMP/kt.log" | sed 's/^/keytool: /'
             exit 1
           fi
-          echo "কী-স্টোর খোলা গেছে ✓"
+          # alias কী-স্টোর থেকেই নেওয়া হয় এবং কী-পাসওয়ার্ড স্টোর-পাসওয়ার্ডের সমান (PKCS12)
+          KEY_ALIAS=$(grep -m1 "PrivateKeyEntry" "$RUNNER_TEMP/kt.log" | cut -d, -f1 | tr -d ' ')
+          if [ -z "$KEY_ALIAS" ]; then
+            echo "::error::কী-স্টোরে কোনো প্রাইভেট কী পাওয়া যায়নি"
+            exit 1
+          fi
+          KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          export KEY_ALIAS KEY_PASSWORD
+          echo "কী-স্টোর খোলা গেছে ✓ (alias: $KEY_ALIAS)"
 
           OUT="HisabFlow-${VERSION}.apk"
           "$BT/zipalign" -p -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
@@ -212,3 +211,4 @@ jobs:
           name: HisabFlow ${{ env.VERSION }} (build ${{ github.run_number }})
           body_path: release-notes.md
           files: ${{ steps.sign.outputs.apk }}
+          
